@@ -16,6 +16,17 @@ use hyper::client::HttpConnector;
 pub use tokio_core::reactor::{Core, Handle};
 
 #[derive(Deserialize, Debug, Default)]
+pub struct Song {
+    pub id: u32,
+    pub title: String,
+    pub artist: String,
+    pub language: String,
+    pub play_count: u32,
+    pub added_on: String,
+    pub favorite: bool
+}
+
+#[derive(Deserialize, Debug, Default)]
 struct LoginResponse {
     session: String,
     email: String,
@@ -34,6 +45,15 @@ struct QueueResponse {
     duration: u32
 }
 
+#[derive(Deserialize, Debug, Default)]
+struct FavoritesResponse {
+    page: u32,
+    per_page: u32,
+    total_pages: u32,
+    total_entries: u32,
+    songs: Vec<Song>
+}
+
 pub struct Voicebox<'a> {
     core: &'a mut Core,
     code: String,
@@ -48,7 +68,8 @@ impl<'a> Voicebox<'a> {
 
     fn request<T: serde::de::DeserializeOwned> (&mut self, method: Method, endpoint: &str, params: Vec<(&str, &str)>) -> T {
         let query = params.into_iter().map(|p| format!("{}={}", p.0, p.1)).join("&");
-        let uri = format!("http://voiceboxpdx.com/api/v1/{}.json/{}", endpoint, query).parse().unwrap();
+        let uri_str = format!("http://voiceboxpdx.com/api/v1/{}.json?{}", endpoint, query);
+        let uri = uri_str.parse().unwrap();
         let req = Request::new(method, uri);
 
         let work = self.client.request(req).and_then(|res| {
@@ -107,5 +128,31 @@ impl<'a> Voicebox<'a> {
                                              ("room_code", &code),
                                              ("from", id)];
         self.request(Method::Delete, "queue", params)
+    }
+
+    pub fn favorites(&mut self) -> Vec<Song> {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session)];
+        let resp: FavoritesResponse = self.request(Method::Get, "songs/favorites", params);
+        let mut result = resp.songs;
+        if resp.total_pages > 1 {
+            result.reserve_exact(resp.total_entries as usize - resp.per_page as usize);
+        }
+        let mut num_pages = resp.total_pages;
+        let mut cur_page = 1;
+        while cur_page < num_pages {
+            cur_page += 1;
+            let page_as_str = format!("{}", cur_page);
+            let params: Vec<(&str, &str)> = vec![("session", &session),
+                                                 ("page", &page_as_str)];
+            let mut resp: FavoritesResponse = self.request(Method::Get, "songs/favorites", params);
+            result.append(&mut resp.songs);
+
+            // Just in case we got more entries and an extra page
+            num_pages = resp.total_pages;
+        };
+        result
     }
 }
