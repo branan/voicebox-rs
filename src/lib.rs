@@ -1,13 +1,21 @@
+#[macro_use]
+extern crate serde_derive;
+extern crate serde;
+extern crate serde_json;
+
+extern crate itertools;
+
 extern crate hyper;
-extern crate rustc_serialize;
+extern crate futures;
+extern crate tokio_core;
 
-use hyper::Client;
-use hyper::header::Connection;
-use hyper::Url;
-use std::io::Read;
-use rustc_serialize::json::{self, Decoder};
+use futures::{Future, Stream};
+use itertools::Itertools;
+use hyper::{Chunk, Client, Method, Request};
+use hyper::client::HttpConnector;
+pub use tokio_core::reactor::{Core, Handle};
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize, Debug, Default)]
 struct LoginResponse {
     session: String,
     email: String,
@@ -16,7 +24,7 @@ struct LoginResponse {
     hide_handle_in_queue: bool
 }
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize, Debug, Default)]
 struct QueueResponse {
     index: u32,
     song_id: u32,
@@ -26,75 +34,78 @@ struct QueueResponse {
     duration: u32
 }
 
-const ROOM_CODE: &'static str = "DNSC";
-const EMAIL: &'static str = "me@branan.info";
-
-struct Voicebox {
+pub struct Voicebox<'a> {
+    core: &'a mut Core,
     code: String,
-    client: Client,
+    client: Client<HttpConnector>,
     session: String,
 }
 
-fn build_url(endpoint: &str, params: Vec<(&str, &str)>) -> String {
-    let mut url = Url::parse(&format!("http://voiceboxpdx.com/api/v1/{}.json", endpoint)).unwrap();
-    url.set_query_from_pairs(params.into_iter());
-    url.serialize()
-}
-
-impl Voicebox {
-    fn new(room_code: &str) -> Voicebox {
-        Voicebox { code: room_code.to_owned(), client: Client::new(), session: String::new() }
+impl<'a> Voicebox<'a> {
+    pub fn new(room_code: &'a str, core: &'a mut Core, handle: &'a mut Handle) -> Voicebox<'a> {
+        Voicebox { core: core, code: room_code.to_owned(), client: Client::new(handle), session: String::new() }
     }
 
-    fn login(&mut self, email: &str) -> String {
+    fn request<T: serde::de::DeserializeOwned> (&mut self, method: Method, endpoint: &str, params: Vec<(&str, &str)>) -> T {
+        let query = params.into_iter().map(|p| format!("{}={}", p.0, p.1)).join("&");
+        let uri = format!("http://voiceboxpdx.com/api/v1/{}.json/{}", endpoint, query).parse().unwrap();
+        let req = Request::new(method, uri);
+
+        let work = self.client.request(req).and_then(|res| {
+            res.body().concat2().and_then(move |body: Chunk| {
+                Ok(serde_json::from_slice(&body).unwrap())
+            })
+        });
+        self.core.run(work).unwrap()
+    }
+
+    pub fn login(&mut self, email: &str) -> String {
         let params = vec![("email", email)];
-        let url = build_url("login", params);
-        let mut res = self.client.post(&url).send().unwrap();
-        let mut body = String::new();
-        res.read_to_string(&mut body).unwrap();
-        let resp: LoginResponse = json::decode(&body).unwrap();
+        let resp: LoginResponse = self.request(Method::Post, "login", params);
         self.session = resp.session;
         resp.handle
     }
 
-    fn popup(&mut self, msg: &str) {
-        let params: Vec<(&str, &str)> = vec![("session", &self.session),
-                          ("room_code", &self.code),
-                          ("text", msg)];
-        let url = build_url("popups", params);
-        let mut res = self.client.post(&url).send().unwrap();
-        let mut body = String::new();
-        res.read_to_string(&mut body).unwrap();
+    pub fn popup(&mut self, msg: &str) {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let code = self.code.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                          ("room_code", &code),
+                                             ("text", msg)];
+        self.request(Method::Post, "login", params)
     }
 
-    fn set_handle(&mut self, handle: &str) {
-        let params: Vec<(&str, &str)> = vec![("session", &self.session),
-                          ("handle", handle)];
-        let url = build_url("profile", params);
-        let mut res = self.client.put(&url).send().unwrap();
-        let mut body = String::new();
-        res.read_to_string(&mut body).unwrap();
+    pub fn set_handle(&mut self, handle: &str) {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                                             ("handle", handle)];
+        self.request(Method::Put, "profile", params)
     }
 
-    fn enqueue_song(&mut self, id: &str) -> String {
-        let params: Vec<(&str, &str)> = vec![("session", &self.session),
-                          ("room_code", &self.code),
-                          ("song_id", id)];
-        let url = build_url("queue", params);
-        let mut res = self.client.post(&url).send().unwrap();
-        let mut body = String::new();
-        res.read_to_string(&mut body).unwrap();
-        let resp: QueueResponse = json::decode(&body).unwrap();
+    pub fn enqueue_song(&mut self, id: &str) -> String {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let code = self.code.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                                             ("room_code", &code),
+                                             ("song_id", id)];
+        let resp: QueueResponse = self.request(Method::Post, "queue", params);
         resp.play_id
     }
 
-    fn delete_song(&mut self, id: &str) {
-        let params: Vec<(&str, &str)> = vec![("session", &self.session),
-                          ("room_code", &self.code),
-                          ("from", id)];
-        let url = build_url("queue", params);
-        let mut res = self.client.delete(&url).send().unwrap();
-        let mut body = String::new();
-        res.read_to_string(&mut body).unwrap();
+    pub fn delete_song(&mut self, id: &str) {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let code = self.code.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                                             ("room_code", &code),
+                                             ("from", id)];
+        self.request(Method::Delete, "queue", params)
     }
 }
