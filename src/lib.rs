@@ -27,6 +27,23 @@ pub struct Song {
 }
 
 #[derive(Deserialize, Debug, Default)]
+pub struct Play {
+    pub song_id: u32,
+    pub play_id: String,
+    pub title: String,
+    pub artist: String,
+    pub location: String,
+    pub business_date: String,
+    pub enqueue_time: String,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub duration: u32,
+    pub position: u32,
+    pub favorite: bool,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
 struct LoginResponse {
     session: String,
     email: String,
@@ -52,6 +69,15 @@ struct FavoritesResponse {
     total_pages: u32,
     total_entries: u32,
     songs: Vec<Song>
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct HistoryResponse {
+    page: u32,
+    per_page: u32,
+    total_pages: u32,
+    total_entries: u32,
+    plays: Vec<Play>
 }
 
 pub struct Voicebox<'a> {
@@ -132,6 +158,7 @@ impl<'a> Voicebox<'a> {
     }
 
     // TODO: expose pagination to the user
+    // TOOD: maybe don't and just expose iterators?
     pub fn favorites(&mut self) -> Vec<Song> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
@@ -158,4 +185,34 @@ impl<'a> Voicebox<'a> {
         };
         result
     }
+
+    // TODO: expose pagination to the user
+    // TOOD: maybe don't and just expose iterators?
+    pub fn history(&mut self) -> Vec<Play> {
+        // TODO: don't clone when we can properly do a partial
+        // borrow of this struct
+        let session = self.session.clone();
+        let params: Vec<(&str, &str)> = vec![("session", &session)];
+        let resp: HistoryResponse = self.request(Method::Get, "plays/history", params);
+        let mut result = resp.plays;
+        if resp.total_pages > 1 {
+            result.reserve_exact(resp.total_entries as usize - resp.per_page as usize);
+        }
+        let mut num_pages = resp.total_pages;
+        let mut cur_page = 1;
+        while cur_page < num_pages {
+            cur_page += 1;
+            let page_as_str = format!("{}", cur_page);
+            let params: Vec<(&str, &str)> = vec![("session", &session),
+                                                 ("page", &page_as_str)];
+            let mut resp: HistoryResponse = self.request(Method::Get, "plays/history", params);
+            result.append(&mut resp.plays);
+
+            // Just in case the data has changed, we re-check our total
+            // pages each time.
+            num_pages = resp.total_pages;
+        };
+        result
+    }
+
 }
