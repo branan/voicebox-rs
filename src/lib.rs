@@ -62,8 +62,9 @@ pub struct Voicebox<'a> {
 }
 
 impl<'a> Voicebox<'a> {
-    pub fn new(room_code: &'a str, core: &'a mut Core, handle: &'a mut Handle) -> Voicebox<'a> {
-        Voicebox { core: core, code: room_code.to_owned(), client: Client::new(handle), session: String::new() }
+    pub fn new(room_code: &'a str, core: &'a mut Core) -> Voicebox<'a> {
+        let mut handle = core.handle();
+        Voicebox { core: core, code: room_code.to_owned(), client: Client::new(&mut handle), session: String::new() }
     }
 
     fn request<T: serde::de::DeserializeOwned> (&mut self, method: Method, endpoint: &str, params: Vec<(&str, &str)>) -> T {
@@ -93,7 +94,7 @@ impl<'a> Voicebox<'a> {
         let session = self.session.clone();
         let code = self.code.clone();
         let params: Vec<(&str, &str)> = vec![("session", &session),
-                          ("room_code", &code),
+                                             ("room_code", &code),
                                              ("text", msg)];
         self.request(Method::Post, "login", params)
     }
@@ -130,6 +131,7 @@ impl<'a> Voicebox<'a> {
         self.request(Method::Delete, "queue", params)
     }
 
+    // TODO: expose pagination to the user
     pub fn favorites(&mut self) -> Vec<Song> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
@@ -150,7 +152,8 @@ impl<'a> Voicebox<'a> {
             let mut resp: FavoritesResponse = self.request(Method::Get, "songs/favorites", params);
             result.append(&mut resp.songs);
 
-            // Just in case we got more entries and an extra page
+            // Just in case the data has changed, we re-check our total
+            // pages each time.
             num_pages = resp.total_pages;
         };
         result
