@@ -2,6 +2,10 @@
 name = "voicebox"
 version = "0.1.0"
 authors = ["Branan Riley <me@branan.info>"]
+description = "Voicebox API wrapper"
+homepage = "https://github.com/branan/voicebox-rs"
+repository = "https://github.com/branan/voicebox-rs"
+license = "GPL-3.0"
 
 [dependencies]
 futures = "0.1"
