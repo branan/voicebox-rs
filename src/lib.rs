@@ -3,6 +3,9 @@ extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
+#[macro_use]
+extern crate error_chain;
+
 extern crate itertools;
 
 extern crate hyper;
@@ -13,9 +16,20 @@ use futures::{Future, Stream};
 use itertools::Itertools;
 use hyper::{Chunk, Client, Method, Request};
 use hyper::client::HttpConnector;
-pub use tokio_core::reactor::{Core, Handle};
+pub use tokio_core::reactor::Core;
 
-#[derive(Deserialize, Debug, Default)]
+mod errors {
+    error_chain! {
+        foreign_links {
+            Hyper(::hyper::Error);
+            Json(::serde_json::Error);
+        }
+    }
+}
+
+pub use errors::{Error,Result};
+
+#[derive(Deserialize, Debug, Default, Clone)]
 pub struct Song {
     pub id: u32,
     pub title: String,
@@ -44,7 +58,7 @@ pub struct Play {
 }
 
 #[derive(Deserialize, Debug, Default)]
-struct LoginResponse {
+pub struct LoginResponse {
     session: String,
     email: String,
     handle: String,
@@ -53,7 +67,7 @@ struct LoginResponse {
 }
 
 #[derive(Deserialize, Debug, Default)]
-struct QueueResponse {
+pub struct QueueResponse {
     index: u32,
     song_id: u32,
     play_id: String,
@@ -63,7 +77,7 @@ struct QueueResponse {
 }
 
 #[derive(Deserialize, Debug, Default)]
-struct FavoritesResponse {
+pub struct FavoritesResponse {
     page: u32,
     per_page: u32,
     total_pages: u32,
@@ -72,7 +86,7 @@ struct FavoritesResponse {
 }
 
 #[derive(Deserialize, Debug, Default)]
-struct HistoryResponse {
+pub struct HistoryResponse {
     page: u32,
     per_page: u32,
     total_pages: u32,
@@ -80,52 +94,56 @@ struct HistoryResponse {
     plays: Vec<Play>
 }
 
-pub struct Voicebox<'a> {
-    core: &'a mut Core,
-    code: String,
+pub struct Voicebox {
+    code: Option<String>,
     client: Client<HttpConnector>,
     session: String,
 }
 
-impl<'a> Voicebox<'a> {
-    pub fn new(room_code: &'a str, core: &'a mut Core) -> Voicebox<'a> {
+pub type BoxFuture<T> = Box<Future<Item=T, Error=Error>>;
+
+impl Voicebox {
+    pub fn new(room_code: Option<String>, core: &mut Core) -> Voicebox {
         let mut handle = core.handle();
-        Voicebox { core: core, code: room_code.to_owned(), client: Client::new(&mut handle), session: String::new() }
+        Voicebox { code: room_code, client: Client::new(&mut handle), session: String::new() }
     }
 
-    fn request<T: serde::de::DeserializeOwned> (&mut self, method: Method, endpoint: &str, params: Vec<(&str, &str)>) -> T {
+    fn request<T: 'static + serde::de::DeserializeOwned> (&mut self, method: Method, endpoint: &str, params: Vec<(&str, &str)>) -> BoxFuture<T> {
         let query = params.into_iter().map(|p| format!("{}={}", p.0, p.1)).join("&");
         let uri_str = format!("http://voiceboxpdx.com/api/v1/{}.json?{}", endpoint, query);
+
+        // We allow this to panic, since we just built the uri string
         let uri = uri_str.parse().unwrap();
         let req = Request::new(method, uri);
 
-        let work = self.client.request(req).and_then(|res| {
-            res.body().concat2().and_then(move |body: Chunk| {
-                Ok(serde_json::from_slice(&body).unwrap())
+        Box::new(self.client.request(req).from_err().and_then(|res| {
+            res.body().concat2().from_err().and_then(move |body: Chunk| {
+                serde_json::from_slice(&body).map_err(|e| Error::from(e))
             })
-        });
-        self.core.run(work).unwrap()
+        }).from_err())
     }
 
-    pub fn login(&mut self, email: &str) -> String {
+    pub fn login(&mut self, email: &str) -> BoxFuture<LoginResponse> {
         let params = vec![("email", email)];
-        let resp: LoginResponse = self.request(Method::Post, "login", params);
-        self.session = resp.session;
-        resp.handle
+        self.request(Method::Post, "login", params)
     }
 
-    pub fn popup(&mut self, msg: &str) {
+    pub fn popup(&mut self, msg: &str) -> BoxFuture<()> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
-        let code = self.code.clone();
+        let code = if self.code.is_some() {
+            self.code.as_ref().unwrap().to_owned()
+        } else {
+            return Box::new(futures::future::result(Err("Missing room code!".into())));
+        };
         let params: Vec<(&str, &str)> = vec![("session", &session),
                                              ("room_code", &code),
                                              ("text", msg)];
         self.request(Method::Post, "login", params)
     }
 
-    pub fn set_handle(&mut self, handle: &str) {
+    pub fn set_handle(&mut self, handle: &str) -> BoxFuture<()> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
@@ -134,85 +152,57 @@ impl<'a> Voicebox<'a> {
         self.request(Method::Put, "profile", params)
     }
 
-    pub fn enqueue_song(&mut self, id: &str) -> String {
+    pub fn enqueue_song(&mut self, id: &str) -> BoxFuture<QueueResponse> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
-        let code = self.code.clone();
+        let code = if self.code.is_some() {
+            self.code.as_ref().unwrap().to_owned()
+        } else {
+            return Box::new(futures::future::result(Err("Missing room code!".into())));
+        };
         let params: Vec<(&str, &str)> = vec![("session", &session),
                                              ("room_code", &code),
                                              ("song_id", id)];
-        let resp: QueueResponse = self.request(Method::Post, "queue", params);
-        resp.play_id
+        self.request(Method::Post, "queue", params)
     }
 
-    pub fn delete_song(&mut self, id: &str) {
+    pub fn delete_song(&mut self, id: &str) -> BoxFuture<()> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
-        let code = self.code.clone();
+        let code = if self.code.is_some() {
+            self.code.as_ref().unwrap().to_owned()
+        } else {
+            return Box::new(futures::future::result(Err("Missing room code!".into())));
+        };
         let params: Vec<(&str, &str)> = vec![("session", &session),
                                              ("room_code", &code),
                                              ("from", id)];
         self.request(Method::Delete, "queue", params)
     }
 
-    // TODO: expose pagination to the user
-    // TOOD: maybe don't and just expose iterators?
-    pub fn favorites(&mut self) -> Vec<Song> {
+    pub fn favorites(&mut self, page: u32, per_page: u32) -> BoxFuture<FavoritesResponse> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
-        let params: Vec<(&str, &str)> = vec![("session", &session)];
-        let resp: FavoritesResponse = self.request(Method::Get, "songs/favorites", params);
-        let mut result = resp.songs;
-        if resp.total_pages > 1 {
-            result.reserve_exact(resp.total_entries as usize - resp.per_page as usize);
-        }
-        let mut num_pages = resp.total_pages;
-        let mut cur_page = 1;
-        while cur_page < num_pages {
-            cur_page += 1;
-            let page_as_str = format!("{}", cur_page);
-            let params: Vec<(&str, &str)> = vec![("session", &session),
-                                                 ("page", &page_as_str)];
-            let mut resp: FavoritesResponse = self.request(Method::Get, "songs/favorites", params);
-            result.append(&mut resp.songs);
-
-            // Just in case the data has changed, we re-check our total
-            // pages each time.
-            num_pages = resp.total_pages;
-        };
-        result
+        let page_as_str = format!("{}", page);
+        let per_page_as_str = format!("{}", per_page);
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                                             ("page", &page_as_str),
+                                             ("per_page", &per_page_as_str)];
+        self.request(Method::Get, "songs/favorites", params)
     }
 
-    // TODO: expose pagination to the user
-    // TOOD: maybe don't and just expose iterators?
-    pub fn history(&mut self) -> Vec<Play> {
+    pub fn history(&mut self, page: u32, per_page: u32) -> BoxFuture<HistoryResponse> {
         // TODO: don't clone when we can properly do a partial
         // borrow of this struct
         let session = self.session.clone();
-        let params: Vec<(&str, &str)> = vec![("session", &session)];
-        let resp: HistoryResponse = self.request(Method::Get, "plays/history", params);
-        let mut result = resp.plays;
-        if resp.total_pages > 1 {
-            result.reserve_exact(resp.total_entries as usize - resp.per_page as usize);
-        }
-        let mut num_pages = resp.total_pages;
-        let mut cur_page = 1;
-        while cur_page < num_pages {
-            cur_page += 1;
-            let page_as_str = format!("{}", cur_page);
-            let params: Vec<(&str, &str)> = vec![("session", &session),
-                                                 ("page", &page_as_str)];
-            let mut resp: HistoryResponse = self.request(Method::Get, "plays/history", params);
-            result.append(&mut resp.plays);
-
-            // Just in case the data has changed, we re-check our total
-            // pages each time.
-            num_pages = resp.total_pages;
-        };
-        result
+        let page_as_str = format!("{}", page);
+        let per_page_as_str = format!("{}", per_page);
+        let params: Vec<(&str, &str)> = vec![("session", &session),
+                                             ("page", &page_as_str),
+                                             ("per_page", &per_page_as_str)];
+        self.request(Method::Get, "plays/history", params)
     }
-
 }
